@@ -9,6 +9,7 @@ namespace AccessoryBoneBinder
     [BepInPlugin(GUID, Name, Version)]
     [BepInDependency(KoikatuAPI.GUID, KoikatuAPI.VersionConst)]
     [BepInDependency("com.rclcircuit.bepinex.modboneimplantor")]
+    [BepInDependency("KKABMX.Core", BepInDependency.DependencyFlags.SoftDependency)]
     public sealed class AccessoryBoneBinderPlugin : BaseUnityPlugin
     {
         public const string GUID = "tomtom.kks.accessorybonebinder";
