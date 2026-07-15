@@ -11,12 +11,15 @@ namespace AccessoryBoneBinder
     public sealed class AccessoryBoneBinderController : CharaCustomFunctionController
     {
         private readonly List<BoundAccessoryBone> _boundBones = new List<BoundAccessoryBone>();
+        private readonly Dictionary<string, AccessoryBindingTarget> _pendingAbmxRefreshBones =
+            new Dictionary<string, AccessoryBindingTarget>();
         private Coroutine _scheduledRebind;
+        private Coroutine _scheduledAbmxRefresh;
 
         protected override void OnReload(GameMode currentGameMode, bool maintainState)
         {
             if (!maintainState)
-                _boundBones.Clear();
+                ReleaseBoundBones("character reload");
             ScheduleRebind();
             base.OnReload(currentGameMode, maintainState);
         }
@@ -33,7 +36,9 @@ namespace AccessoryBoneBinder
 
         protected override void OnDestroy()
         {
-            _boundBones.Clear();
+            if (_scheduledAbmxRefresh != null)
+                StopCoroutine(_scheduledAbmxRefresh);
+            ReleaseBoundBones("controller destroy");
             base.OnDestroy();
         }
 
@@ -44,6 +49,41 @@ namespace AccessoryBoneBinder
             _scheduledRebind = StartCoroutine(DelayedRebind());
         }
 
+        internal bool RebindImmediatelyForCompatibility()
+        {
+            if (_scheduledRebind != null)
+            {
+                StopCoroutine(_scheduledRebind);
+                _scheduledRebind = null;
+            }
+
+            return RebindAccessories();
+        }
+
+        internal void AccessoryKindChangedEvent(int slot)
+        {
+            AbmxBridge.ClearSlotCurrentCoordinateIfAvailable(ChaControl, slot, CurrentCoordinateIndex);
+            ScheduleRebind();
+        }
+
+        internal void AccessoryTransferredEvent(int sourceSlot, int destinationSlot)
+        {
+            AbmxBridge.CopySlotCurrentCoordinateIfAvailable(
+                ChaControl, sourceSlot, destinationSlot, CurrentCoordinateIndex);
+            ScheduleRebind();
+        }
+
+        internal void AccessoriesCopiedEvent(int sourceCoordinate, int destinationCoordinate,
+            IEnumerable<int> copiedSlots)
+        {
+            AbmxBridge.CopySlotsAcrossCoordinatesIfAvailable(
+                ChaControl, sourceCoordinate, destinationCoordinate, copiedSlots);
+            if (CurrentCoordinateIndex == destinationCoordinate)
+                ScheduleRebind();
+        }
+
+        private int CurrentCoordinateIndex => ChaControl == null ? 0 : ChaControl.fileStatus.coordinateType;
+
         private IEnumerator DelayedRebind()
         {
             yield return null;
@@ -52,35 +92,45 @@ namespace AccessoryBoneBinder
             RebindAccessories();
         }
 
-        private void RebindAccessories()
+        private bool RebindAccessories()
         {
-            if (ChaControl == null) return;
+            if (ChaControl == null) return false;
             var accessories = ChaControl.objAccessory;
-            if (accessories == null) return;
+            if (accessories == null) return false;
 
             CleanupDeadBindings(accessories);
             var bodyBones = BuildBodyBoneDictionary();
             if (bodyBones.Count == 0)
             {
                 AccessoryBoneBinderPlugin.Log?.LogWarning($"No body bones found for {ChaControl.name}; accessory bones cannot be bound.");
-                return;
+                return false;
             }
 
+            bool anyBoundOrRebound = false;
+            var changedBones = new Dictionary<string, AccessoryBindingTarget>();
             for (int slot = 0; slot < accessories.Length; slot++)
             {
                 var accessoryRoot = accessories[slot];
                 if (accessoryRoot == null) continue;
-                BindAccessory(slot, accessoryRoot, bodyBones);
+                anyBoundOrRebound |= BindAccessory(slot, accessoryRoot, bodyBones, changedBones);
             }
+
+            if (anyBoundOrRebound)
+                ScheduleAbmxRefresh(changedBones);
+
+            return anyBoundOrRebound;
         }
 
-        private void BindAccessory(int slot, GameObject accessoryRoot, Dictionary<string, Transform> bodyBones)
+        private bool BindAccessory(int slot, GameObject accessoryRoot, Dictionary<string, Transform> bodyBones,
+            Dictionary<string, AccessoryBindingTarget> changedBones)
         {
             var implants = accessoryRoot.GetComponentsInChildren<BoneImplantProcess>(true);
-            if (implants == null || implants.Length == 0) return;
+            if (implants == null || implants.Length == 0) return false;
 
-            foreach (var implant in implants)
+            bool changed = false;
+            for (int implantIndex = 0; implantIndex < implants.Length; implantIndex++)
             {
+                var implant = implants[implantIndex];
                 if (implant == null) continue;
                 var source = implant.trfSrc;
                 var destination = implant.trfDst;
@@ -97,37 +147,67 @@ namespace AccessoryBoneBinder
                     continue;
                 }
 
-                if (IsAlreadyBound(source, accessoryRoot, slot, bodyParent))
+                if (TryRefreshExistingBinding(source, accessoryRoot, slot, bodyParent,
+                        out var existingBinding))
+                {
+                    changed = true;
+                    changedBones[existingBinding.AliasBoneName] = existingBinding.ToTarget();
                     continue;
+                }
 
-                _boundBones.Add(new BoundAccessoryBone
+                string originalBoneName = source.name;
+                string sourceRelativePath = AccessoryBindingIdentity.GetRelativePath(
+                    accessoryRoot.transform, source);
+                string aliasBoneName = AccessoryBindingIdentity.CreateAlias(
+                    slot, sourceRelativePath, originalBoneName, targetName, implantIndex);
+
+                CleanupDuplicateBodyChildren(aliasBoneName, source, bodyParent);
+                source.name = aliasBoneName;
+
+                var boundBone = new BoundAccessoryBone
                 {
                     Slot = slot,
+                    ImplantIndex = implantIndex,
                     AccessoryRoot = accessoryRoot,
                     SourceRoot = source,
+                    SourceRelativePath = sourceRelativePath,
+                    OriginalBoneName = originalBoneName,
+                    AliasBoneName = aliasBoneName,
                     OriginalParent = source.parent,
                     OriginalLocalPosition = source.localPosition,
                     OriginalLocalRotation = source.localRotation,
                     OriginalLocalScale = source.localScale,
                     BodyParent = bodyParent,
                     TargetBoneName = targetName
-                });
+                };
+                _boundBones.Add(boundBone);
 
                 source.SetParent(bodyParent, false);
-                AccessoryBoneBinderPlugin.Log?.LogInfo($"Bound accessory slot {slot + 1}: {source.name} -> {targetName}");
+                changed = true;
+                changedBones[aliasBoneName] = boundBone.ToTarget();
+                AccessoryBoneBinderPlugin.Log?.LogInfo(
+                    $"Bound accessory slot {slot + 1}: {originalBoneName} -> {targetName} as {aliasBoneName}");
             }
+
+            return changed;
         }
 
-        private bool IsAlreadyBound(Transform source, GameObject accessoryRoot, int slot, Transform bodyParent)
+        private bool TryRefreshExistingBinding(Transform source, GameObject accessoryRoot, int slot,
+            Transform bodyParent, out BoundAccessoryBone existingBinding)
         {
+            existingBinding = null;
             foreach (var bound in _boundBones)
             {
                 if (bound.SourceRoot == source)
                 {
+                    existingBinding = bound;
+                    source.name = bound.AliasBoneName;
                     if (source.parent != bodyParent)
                     {
                         source.SetParent(bodyParent, false);
                         bound.BodyParent = bodyParent;
+                        AccessoryBoneBinderPlugin.Log?.LogInfo(
+                            $"Rebound accessory slot {slot + 1}: {bound.OriginalBoneName} -> {bodyParent.name}");
                     }
                     bound.AccessoryRoot = accessoryRoot;
                     bound.Slot = slot;
@@ -136,6 +216,74 @@ namespace AccessoryBoneBinder
             }
 
             return false;
+        }
+
+        private void ReleaseBoundBones(string reason)
+        {
+            if (_scheduledAbmxRefresh != null)
+            {
+                StopCoroutine(_scheduledAbmxRefresh);
+                _scheduledAbmxRefresh = null;
+            }
+            _pendingAbmxRefreshBones.Clear();
+
+            for (int i = _boundBones.Count - 1; i >= 0; i--)
+            {
+                var bound = _boundBones[i];
+                if (bound.SourceRoot != null)
+                {
+                    AccessoryBoneBinderPlugin.Log?.LogDebug($"Removing bound accessory bone {bound.SourceRoot.name} during {reason}.");
+                    Destroy(bound.SourceRoot.gameObject);
+                }
+                _boundBones.RemoveAt(i);
+            }
+        }
+
+        private void CleanupDuplicateBodyChildren(string aliasBoneName, Transform source, Transform bodyParent)
+        {
+            if (source == null || bodyParent == null)
+                return;
+
+            for (int i = bodyParent.childCount - 1; i >= 0; i--)
+            {
+                var child = bodyParent.GetChild(i);
+                if (child == null || child == source || child.name != aliasBoneName)
+                    continue;
+                if (_boundBones.Any(x => x.SourceRoot == child))
+                    continue;
+
+                AccessoryBoneBinderPlugin.Log?.LogDebug(
+                    $"Removing stale duplicate accessory bone {child.name} under {bodyParent.name}.");
+                Destroy(child.gameObject);
+            }
+        }
+
+        private void ScheduleAbmxRefresh(IDictionary<string, AccessoryBindingTarget> changedBones)
+        {
+            foreach (var bone in changedBones)
+                _pendingAbmxRefreshBones[bone.Key] = bone.Value;
+            RequestAbmxRefresh();
+            if (_scheduledAbmxRefresh != null)
+                StopCoroutine(_scheduledAbmxRefresh);
+            _scheduledAbmxRefresh = StartCoroutine(DelayedAbmxRefresh());
+        }
+
+        private IEnumerator DelayedAbmxRefresh()
+        {
+            yield return null;
+            yield return null;
+            _scheduledAbmxRefresh = null;
+            RequestAbmxRefresh();
+            _pendingAbmxRefreshBones.Clear();
+        }
+
+        private void RequestAbmxRefresh()
+        {
+            if (_pendingAbmxRefreshBones.Count == 0)
+                return;
+
+            if (AbmxBridge.RequestRefreshIfAvailable(ChaControl, _pendingAbmxRefreshBones))
+                AccessoryBoneBinderPlugin.Log?.LogDebug($"Requested ABMX refresh for {ChaControl.name} after accessory bone binding.");
         }
 
         private Dictionary<string, Transform> BuildBodyBoneDictionary()
@@ -177,14 +325,32 @@ namespace AccessoryBoneBinder
         private sealed class BoundAccessoryBone
         {
             public int Slot;
+            public int ImplantIndex;
             public GameObject AccessoryRoot;
             public Transform SourceRoot;
+            public string SourceRelativePath;
+            public string OriginalBoneName;
+            public string AliasBoneName;
             public Transform OriginalParent;
             public Vector3 OriginalLocalPosition;
             public Quaternion OriginalLocalRotation;
             public Vector3 OriginalLocalScale;
             public Transform BodyParent;
             public string TargetBoneName;
+
+            public AccessoryBindingTarget ToTarget()
+            {
+                return new AccessoryBindingTarget
+                {
+                    Slot = Slot,
+                    ImplantIndex = ImplantIndex,
+                    SourceRelativePath = SourceRelativePath,
+                    OriginalBoneName = OriginalBoneName,
+                    TargetBoneName = TargetBoneName,
+                    AliasBoneName = AliasBoneName,
+                    SourceTransform = SourceRoot
+                };
+            }
         }
     }
 }

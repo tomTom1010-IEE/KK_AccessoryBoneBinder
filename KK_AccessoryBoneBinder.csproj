@@ -35,5 +35,9 @@
       <HintPath>dlls\BepInEx\plugins\ModBoneImplantor.dll</HintPath>
       <Private>false</Private>
     </Reference>
+    <Reference Include="KKABMX">
+      <HintPath>dlls\BepInEx\plugins\KKABMX.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
   </ItemGroup>
 </Project>
